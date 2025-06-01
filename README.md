@@ -1,4 +1,4 @@
-NMR-Project
+#NMR-Project
 This project provides a comprehensive pipeline for parsing, analyzing, and visualizing Nuclear Magnetic Resonance (NMR) spectroscopy data, with a focus on 1H-NMR. It includes data import, Fourier transformation, peak detection, integration, functional group identification, spin-spin coupling analysis, and quantum mechanical simulation of spin systems.
 
 Features
