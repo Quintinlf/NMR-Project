@@ -8,7 +8,7 @@ It includes data import, Fourier transformation, peak detection, integration, fu
 ## ✨ Features
 
 - 📥 **Data Import & Visualization**  
-  Reads JEOL ASCII FID files and visualizes the raw time-domain signal.
+  Reads JEOL ASCII FID files and visualizes the raw time-domain signal. **(ASCII reccommended)**
 
 - 🔄 **Fourier Transform**  
   Converts the time-domain FID to the frequency domain using FFT, producing the NMR spectrum.
