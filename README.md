@@ -118,7 +118,7 @@ This project is for educational and research purposes.
 
 ## 👤 Author
 
-Created by Quintin  
+Created by Quintinlf
 For questions, open an issue or contact via GitHub.
 
 ---
