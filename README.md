@@ -34,7 +34,7 @@ NMR-Project/
 │   └── 13_03_11_indst_1H fid.asc        # Raw JEOL FID ASCII data files
 │
 ├── notebooks/
-│   ├── Main_project.ipynb               # Main analysis notebook
+│   ├── project_1_spring_2025.ipynb      # Main analysis notebook
 │   ├── parsing_nmr_data.ipynb           # Data import & FFT walkthrough
 │   ├── testing_functions.ipynb          # Notebook for testing/refactoring functions
 │   ├── function_ideas.ipynb             # Supplementary ideas and code snippets
