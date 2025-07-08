@@ -31,27 +31,25 @@ It includes data import, Fourier transformation, peak detection, integration, fu
 NMR-Project/
 │
 ├── data/
-│   └── 13_03_11_indst_1H fid.asc        # Raw JEOL FID ASCII data files
+│ └── 13_03_11_indst_1H fid.asc # Raw JEOL FID ASCII data files
 │
 ├── notebooks/
-│   ├── Main_project.ipynb               # Main analysis notebook
-│   ├── parsing_nmr_data.ipynb           # Data import & FFT walkthrough
-│   ├── testing_functions.ipynb          # Notebook for testing/refactoring functions
-│   ├── function_ideas.ipynb             # Supplementary ideas and code snippets
-│   └── Big_ideas.ipynb                  # Project goals and conceptual notes
+│ ├── Main_project.ipynb # Main analysis notebook
+│ ├── parsing_nmr_data.ipynb # Data import & FFT walkthrough
+│ ├── testing_functions.ipynb # Notebook for testing/refactoring functions
+│ ├── function_ideas.ipynb # Supplementary ideas and code snippets
+│ └── Big_ideas.ipynb # Project goals and conceptual notes
 │
 ├── nmr/
-│   ├── __init__.py                      # Makes this a Python package
-│   ├── nmr_functions.py                 # All reusable NMR analysis functions/classes
-│   └── quantum_sim.py                   # Quantum simulation utilities (optional)
+│ ├── init.py # Makes this a Python package
+│ ├── nmr_functions.py # All reusable NMR analysis functions/classes
+│ └── quantum_sim.py # Quantum simulation utilities (optional)
 │
 ├── outputs/
-│   └── pen.gif                          # Example animation output
+│ └── pen.gif # Example animation output
 │
-├── README.md                            # Project overview and usage
-├── requirements.txt                     # List of dependencies (for pip install -r)
-└── .gitignore                           # Ignore data, outputs, etc. as needed
-
+├── README.md # Project overview and usage
+├── requirements.txt # List of dependencies (for pip install -r)
 ---
 
 ## 🚀 Usage
