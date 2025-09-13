@@ -1,3 +1,35 @@
+def load_fid_and_preview(source, delimiter='\t', skip_header=1,
+                         columns=('X', 'Real', 'Imaginary'),
+                         name=None, preview_rows=5):
+    """
+    Load JEOL ASCII FID (3 columns) from URL or local path, print head, and return (df, name).
+    """
+    try:
+        data = np.genfromtxt(source, delimiter=delimiter, skip_header=skip_header)
+    except Exception as e:
+        raise RuntimeError(f"Failed to read data from {source}: {e}")
+
+    if data is None or data.size == 0:
+        raise ValueError("Loaded data is empty.")
+
+    # Ensure 2D shape and exactly 3 columns expected by this notebook
+    if data.ndim == 1:
+        raise ValueError("File appears to have 1 column; expected 3 columns (X, Real, Imaginary).")
+    if data.shape[1] < 3:
+        raise ValueError(f"Found {data.shape[1]} columns; expected 3.")
+    if data.shape[1] > 3:
+        data = data[:, :3]  # take first three columns
+
+    df = pd.DataFrame(data, columns=list(columns))
+
+    if name is None:
+        # Infer a friendly name from the source path/URL
+        path = str(source)
+        base = os.path.basename(urlparse(path).path) if (path.startswith("http://") or path.startswith("https://")) else os.path.basename(path)
+        name = os.path.splitext(base)[0].replace('%20', ' ')
+
+    print(df.head(preview_rows))
+    return df, name
 def identify_functional_groups(positive_frequencies, positive_magnitudes, ppm_shifts):
     """
     Identify functional groups based on peak positions in the spectrum.
