@@ -1,3 +1,11 @@
+import numpy as np
+import pandas as pd
+import os
+from urllib.parse import urlparse
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+from scipy.fft import fftshift, fft, fftfreq
+
 def load_fid_and_preview(source, delimiter='\t', skip_header=1,
                          columns=('X', 'Real', 'Imaginary'),
                          name=None, preview_rows=5):
@@ -30,6 +38,248 @@ def load_fid_and_preview(source, delimiter='\t', skip_header=1,
 
     print(df.head(preview_rows))
     return df, name
+
+def plot_fid(data, title=None, xcol=0, ycol=1, xlabel="Seconds(s)", ylabel="Abundance", invert_x=False, ax=None, show=True):
+    """
+    Plot time-domain FID from a DataFrame or NumPy array.
+    Returns (fig, ax). If show=False, the figure is not shown.
+    """
+    # Normalize input to NumPy
+    arr = data.to_numpy() if hasattr(data, "to_numpy") else np.asarray(data)
+
+    # Validate
+    if arr is None or arr.size == 0 or arr.ndim < 2 or max(xcol, ycol) >= arr.shape[1]:
+        print("No valid data found in the file.")
+        return None, None
+
+    # Create axes if needed
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 5))
+    else:
+        fig = ax.figure
+
+    # Plot
+    ax.plot(arr[:, xcol], arr[:, ycol])
+    ax.set_title(title or "")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if invert_x:
+        ax.invert_xaxis()
+
+    if show:
+        plt.show()
+
+    return fig, ax
+
+# ...existing code...
+def plot_full_and_zoom_with_peaks(
+    frequencies,
+    magnitudes,
+    title,
+    spectrometer_freq=399.78219838,
+    ppm_range=None,
+    identify_functional_groups=None,
+    ppm_shifts=None,
+    identified_groups=None,
+    min_distance_hz=7.0,
+    height_frac=0.10,
+    prominence_frac=0.05,
+    ax_full=None,
+    ax_zoom=None,
+    show=True
+):
+    """
+    Flexible spectrum plotter:
+      - Accepts full (negative..positive) or already-positive frequency axis (Hz)
+      - Detects peaks
+      - Optional functional group tagging
+      - Returns dict of results
+    """
+    freqs = np.asarray(frequencies)
+    mags = np.asarray(magnitudes)
+
+    if freqs.size == 0 or mags.size == 0:
+        print("Empty spectrum.")
+        return {}
+
+    # Determine if full spectrum (has negatives) or only positive
+    is_full = (freqs.min() < 0) and (freqs.max() > 0)
+
+    if is_full:
+        # Center zero with fftshift
+        freqs_shifted = fftshift(freqs)
+        mags_shifted = fftshift(mags)
+    else:
+        # Already positive-only
+        freqs_shifted = freqs
+        mags_shifted = mags
+
+    # Compute ppm axis
+    ppm_axis = freqs_shifted / spectrometer_freq
+
+    # Infer ppm_range if not supplied
+    if ppm_range is None:
+        ppm_range = float(ppm_axis.max() - ppm_axis.min())
+        # For positive-only spectra typical 1H window ~12 ppm; clamp if too large
+        if ppm_range <= 0 or ppm_range > 20:
+            ppm_range = 12.0
+
+    # Peak detection thresholds
+    max_int = float(mags_shifted.max())
+    if max_int == 0:
+        print("All-zero intensity.")
+        return {}
+
+    height = height_frac * max_int
+    prominence = prominence_frac * max_int
+
+    n_points = len(mags_shifted)
+    # Approximate Hz per point from ppm window
+    hz_per_point = (ppm_range * spectrometer_freq) / n_points
+    min_distance_pts = max(1, int(min_distance_hz / hz_per_point))
+
+    from scipy.signal import find_peaks
+    peaks, properties = find_peaks(
+        mags_shifted,
+        height=height,
+        distance=min_distance_pts,
+        prominence=prominence
+    )
+
+    # Functional group identification (expects ppm_axis)
+    if identified_groups is None and callable(identify_functional_groups) and ppm_shifts is not None:
+        identified_groups = identify_functional_groups(ppm_axis, mags_shifted, ppm_shifts)
+    identified_groups = identified_groups or []
+
+    # Zoom window
+    if identified_groups:
+        peak_ppms = [p for p, _ in identified_groups]
+        x_min = min(peak_ppms) - 0.1
+        x_max = max(peak_ppms) + 0.1
+        print("Identified functional groups:")
+        for p, g in identified_groups:
+            print(f"The Peak at {p:.2f} ppm corresponds to a {g}")
+        print(f"Graph automatically zoomed to range: {x_min:.2f}–{x_max:.2f} ppm")
+    else:
+        # Default 0–ppm_range (assuming downfield to upfield)
+        x_min, x_max = 0.0, float(ppm_range)
+        # Normalize ordering (largest ppm on left)
+        if x_max < x_min:
+            x_min, x_max = x_max, x_min
+        print("No functional groups identified.")
+
+    created_fig = False
+    if ax_full is None or ax_zoom is None:
+        fig, (ax_full, ax_zoom) = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+        created_fig = True
+    else:
+        fig = ax_full.figure
+
+    # Full plot
+    ax_full.plot(ppm_axis, mags_shifted, label="Spectrum (FFT)")
+    if peaks.size:
+        ax_full.plot(ppm_axis[peaks], mags_shifted[peaks], "x", label="Detected Peaks")
+    ax_full.invert_xaxis()
+    # Show typical 1H window if makes sense
+    left_lim = max(ppm_axis.max(), x_max) if is_full else (ppm_axis.max())
+    right_lim = min(ppm_axis.min(), x_min) if is_full else (ppm_axis.min())
+    # Fallback to (ppm_range, 0) if positive-only
+    if not is_full:
+        ax_full.set_xlim(min(x_max, ppm_range), 0)
+    ax_full.set_xlabel("Chemical Shift (ppm)")
+    ax_full.set_ylabel("Intensity (A.U.)")
+    ax_full.set_title(title)
+    ax_full.legend()
+
+    # Zoom plot
+    ax_zoom.plot(ppm_axis, mags_shifted, label="Spectrum (FFT)")
+    if peaks.size:
+        ax_zoom.plot(ppm_axis[peaks], mags_shifted[peaks], "x", label="Detected Peaks")
+    ax_zoom.invert_xaxis()
+    ax_zoom.set_xlim(x_max, x_min)
+    ax_zoom.set_xlabel("Chemical Shift (ppm)")
+    ax_zoom.set_title(f"{title} (zoom)")
+    ax_zoom.legend()
+
+    if show and created_fig:
+        plt.tight_layout()
+        plt.show()
+
+    return {
+        "fig": fig,
+        "axes": (ax_full, ax_zoom),
+        "ppm_axis": ppm_axis,
+        "intensity": mags_shifted,
+        "peaks": peaks,
+        "properties": properties,
+        "identified_groups": identified_groups,
+    }
+
+def compute_fft_spectrum(fid_array, time_col=0, real_col=1, window=None, zero_fill=None):
+    """
+    Compute FFT spectrum from FID array.
+
+    Args:
+        fid_array (ndarray): FID data with time in time_col and real signal in real_col.
+        time_col (int): Column index for time (seconds).
+        real_col (int): Column index for real FID values.
+        window (str|None): Optional apodization: 'exp', 'hamming', 'hann', etc.
+        zero_fill (int|None): If set and > current length, zero fill to this length (next power of 2 recommended).
+
+    Returns:
+        dict with keys:
+            real_part
+            dt
+            n
+            frequencies (Hz, signed)
+            magnitude (abs FFT, not scaled)
+            positive_frequencies (Hz >=0)
+            positive_magnitude
+    """
+    real_part = fid_array[:, real_col].astype(float)
+    time_axis = fid_array[:, time_col].astype(float)
+    dt = time_axis[1] - time_axis[0]
+    n = len(real_part)
+
+    # Optional apodization
+    if window:
+        w = None
+        if window == "exp":
+            # simple exponential decay
+            t = np.arange(n) * dt
+            lw = 1.0  # line‑broadening factor (Hz) tweak if desired
+            w = np.exp(-lw * t * np.pi)
+        elif window == "hamming":
+            w = np.hamming(n)
+        elif window == "hann":
+            w = np.hanning(n)
+        if w is not None:
+            real_part = real_part * w
+
+    # Optional zero fill
+    if zero_fill and zero_fill > n:
+        zf_n = int(zero_fill)
+        pad = zf_n - n
+        real_part = np.pad(real_part, (0, pad), mode='constant')
+        n = len(real_part)
+
+    fft_res = fft(real_part)
+    freqs = fftfreq(n, d=dt)
+    mag = np.abs(fft_res)
+
+    mask = freqs >= 0
+    return {
+        "real_part": real_part,
+        "dt": dt,
+        "n": n,
+        "frequencies": freqs,
+        "magnitude": mag,
+        "positive_frequencies": freqs[mask],
+        "positive_magnitude": mag[mask],
+    }
+# ...existing code...
+
+
 def identify_functional_groups(positive_frequencies, positive_magnitudes, ppm_shifts):
     """
     Identify functional groups based on peak positions in the spectrum.
@@ -56,6 +306,8 @@ def identify_functional_groups(positive_frequencies, positive_magnitudes, ppm_sh
                 break
 
     return identified_groups
+
+
 def auto_zoom_functional_groups(positive_frequencies, positive_magnitude, identified_groups, ppm_shifts, buffer=0.01):
     """
     For each functional group with detected peaks, plot a zoomed-in graph
