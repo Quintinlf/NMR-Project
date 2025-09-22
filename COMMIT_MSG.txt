@@ -1,0 +1,46 @@
+﻿feat(nmr-dl): FID denoising with dilated Conv1D, curriculum, AMP + chemist-facing math/docs
+
+Summary
+- Load FID, per-channel normalize, convert to torch tensor (batch=1, channels=2 [real, imag], length=L).
+- Implement DenoiseNet (residual dilated Conv1D blocks), parameter/RF inspection, and shape checks.
+- Synthetic FID generator (damped sinusoids) for supervised training.
+- Curriculum training (noise sigma: 0.10 -> 0.03), OneCycleLR (safe fallback), AMP (GPU/CPU), cuDNN benchmark.
+- Per-epoch validation vs noisy baseline with ΔSNR metric; tiny-batch overfit diagnostic.
+- Apply model to real FID; plot original vs denoised (real/imag).
+- Optional larger model (hidden=64, k=11, dilations up to 64) for capacity.
+
+Chemist-facing math and assumptions
+- FID model: x(t) = Σ_k A_k e^{-t/T2,k} cos(2π f_k t + φ_k) + n(t), with additive noise n(t) ~ N(0, σ^2).
+- Normalization (per channel): x_hat = (x − μ) / (σ + 1e−8) for stable training.
+- Denoising objective (per-sample MSE): MSE = (1/N) ||y_hat − y||^2, where y = clean FID, y_hat = model(x_noisy).
+- SNR improvement printed: ΔSNR_dB = 20·log10(RMSE_noisy / RMSE_model). For σ=0.03, noise variance ≈ 0.0009.
+- Conv1D parameters: weights shape (C_out, C_in, K); params = C_out * C_in * K (+C_out if bias).
+- Dilation receptive field: K_eff = D*(K−1)+1; cumulative RF adds (K_eff−1) per conv layer.
+- Residual learning: output = input + correction; preserves peaks/phase structure.
+
+Problems encountered and fixes
+- Val ΔSNR ≈ 0 dB at first:
+  - Likely reinitializing the model between cells or too few steps at target noise.
+  - Fix: curriculum (0.10 -> 0.03), longer loops, optional scheduler; overfit diagnostic confirms gradients flow.
+- Slow iteration on CPU/notebook:
+  - Fix: shorter crops (e.g., 2048), fewer steps/epoch, AMP, cuDNN benchmark; optional GPU.
+- Risk of accidental reinit in notebook:
+  - Fix: avoid rerunning init cells mid-training; add a model init guard or move training to a script.
+
+Where chemists/instructor can help
+- Provide acquisition parameters (spectrometer freq, dwell time, T2 ranges, phase) to improve simulator fidelity.
+- Curate small paired datasets: raw FID ↔ cleaned/reference (long-acquisition or ensemble-averaged FIDs) for fine-tuning and benchmarking.
+- Define constraints: acceptable smoothing vs peak integrity; phase conventions; expected line shapes to guide losses/metrics.
+
+Future scaling and reliability
+- Promote notebook code into train.py with argparse; log to TensorBoard/CSV; early stopping + checkpoints.
+- Add model init guard/checkpoint resume; seed for reproducibility.
+- Increase capacity/depth if plateauing (hidden=64+, more dilations); validate across multiple σ.
+- Add frequency-domain validation (FFT → SNR, linewidth, area conservation).
+- Add requirements.txt and use a venv for reproducible environments.
+
+Files affected
+- deep_learning_model.ipynb (model, training, validation, plots, diagnostics)
+
+Notes
+- The “Upgraded model” block reinitializes weights (model = DenoiseNet().apply(init_weights)); avoid running it after training unless intentional.
