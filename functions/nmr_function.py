@@ -6,6 +6,20 @@ import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from scipy.fft import fftshift, fft, fftfreq
 
+
+PPM_SHIFT_DEFAULTS = {
+    "Alkyl (sp3 CH3/CH2/CH)": "0.80-1.50ppm",
+    "Allylic / Next to C=C": "1.60-2.20ppm",
+    "Benzylic / Next to Ar": "2.20-2.90ppm",
+    "Alkyne (≡C–H)": "1.80-2.60ppm",
+    "α to C=O (ketone/ester)": "2.00-3.20ppm",
+    "Halogen / O / N adjacent": "3.00-4.50ppm",
+    "Vinylic (C=C–H)": "4.50-6.50ppm",
+    "Aromatic (Ar–H)": "6.00-8.50ppm",
+    "Aldehyde (–CHO)": "9.50-10.50ppm",
+    "Carboxylic Acid (–COOH)": "10.00-13.00ppm"
+}
+
 def load_fid_and_preview(source, delimiter='\t', skip_header=1,
                          columns=('X', 'Real', 'Imaginary'),
                          name=None, preview_rows=5):
