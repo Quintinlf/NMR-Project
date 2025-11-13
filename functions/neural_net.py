@@ -12,6 +12,7 @@ instantiate the architecture first and then load the latest checkpoint.
 from typing import Optional, Tuple
 import torch, torch.nn as nn, torch.nn.functional as F
 import math  # <-- needed for math.pi in synth_batch_phys
+import numpy as np  # ensure numpy is always available even if TF import fails
 
 
 # --- (A) Legacy TensorFlow demo (kept for backwards-compatibility) ---
@@ -128,6 +129,11 @@ def build_model_from_latest(checkpoints_dir: str, latest_name: str = "DenoiseNet
     latest_path = os.path.join(checkpoints_dir, latest_name)
     ok, msg = load_checkpoint(model, latest_path, map_location=device, strict=False)
     print(msg)
+    # If checkpoint loaded but contained non-finite params, reinitialize to safe defaults
+    if ok and _has_non_finite_params(model):
+        print("[Warn] Loaded checkpoint contains NaN/Inf parameters → reinitializing model weights")
+        _reinit_model_(model)
+        ok = False
     setattr(model, "_loaded_from", latest_path if ok else None)
     return model, (latest_path if ok else None)
 
@@ -139,15 +145,18 @@ __all__ = [
     'DilatedResBlock', 'DenoiseNetPhysics',
     # helpers
     'count_params', 'load_checkpoint', 'build_model_from_latest',
+    # training utilities
+    'synth_batch_phys', 'combined_loss',
 ]
 
 
-def synth_batch_phys(batch_size: int, L: int, snr_std: float = 0.03, colored_noise: bool = True):
+def synth_batch_phys(batch_size: int, L: int, snr_std: float = 0.03, colored_noise: bool = True, device: Optional[torch.device] = None):
     """
     Generate synthetic complex FIDs: sum of damped complex sinusoids + optional colored noise.
     Returns (x_noisy, y_clean) with shape (B, 2, L), float32, on CUDA if available.
+    Noise scaling is robust to vanishing tails by referencing the 20th-percentile envelope.
     """
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     B = int(batch_size)
     n = torch.arange(L, device=device, dtype=torch.float32)[None, :]  # (1,L)
 
@@ -157,7 +166,8 @@ def synth_batch_phys(batch_size: int, L: int, snr_std: float = 0.03, colored_noi
 
     Kmin, Kmax = 2, 6
     for b in range(B):
-        K = np.random.randint(Kmin, Kmax + 1)
+        # sample number of components per sample without relying on numpy
+        K = int(torch.randint(Kmin, Kmax + 1, (1,), device=device))
         f = torch.empty(K, device=device).uniform_(-0.45, 0.45)             # cycles/sample in Nyquist
         alpha = torch.empty(K, device=device).uniform_(1e-3, 8e-3)          # per-sample decay
         phi = torch.empty(K, device=device).uniform_(0, 2 * math.pi)
@@ -174,10 +184,11 @@ def synth_batch_phys(batch_size: int, L: int, snr_std: float = 0.03, colored_noi
         y_real = y_real + (0.02 * torch.randn(B, 1, device=device)) * (t**2)[None, :]
         y_imag = y_imag + (0.02 * torch.randn(B, 1, device=device)) * (t**2)[None, :]
 
-    # Noise scaled to tail RMS
-    tail = slice(int(0.8 * L), L)
-    tail_rms = torch.sqrt((y_real[:, tail]**2 + y_imag[:, tail]**2).mean(dim=1) + 1e-12)  # (B,)
-    sigma = (snr_std * tail_rms).clamp(min=1e-6)                                          # (B,)
+    # Robust amplitude reference from envelope (avoid tiny tails)
+    env = torch.sqrt(y_real**2 + y_imag**2)  # (B,L)
+    # 20th percentile per batch element
+    q20 = torch.quantile(env, 0.20, dim=1).clamp_min(1e-3)  # (B,)
+    sigma = (snr_std * q20).clamp(min=1e-6)                 # (B,)
     nr = torch.randn(B, L, device=device) * sigma[:, None]
     ni = torch.randn(B, L, device=device) * sigma[:, None]
 
@@ -198,6 +209,11 @@ def synth_batch_phys(batch_size: int, L: int, snr_std: float = 0.03, colored_noi
 
     y = torch.stack([y_real, y_imag], dim=1).to(torch.float32)  # (B,2,L)
     x = torch.stack([x_real, x_imag], dim=1).to(torch.float32)  # (B,2,L)
+    # sanity checks
+    if not torch.isfinite(x).all() or not torch.isfinite(y).all():
+        raise RuntimeError("Non-finite values produced in synth_batch_phys")
+    if torch.mean((x - y)**2).item() <= 1e-12:
+        raise RuntimeError("synth_batch_phys produced x≈y (noise not added)")
     return x, y
 
 # ...existing code...
@@ -205,80 +221,70 @@ import torch
 import torch.nn.functional as F
 # ...existing code...
 
-def _complex_rfft(signal_2ch: torch.Tensor):
-    """
-    signal_2ch: (B,2,L) real+imag
-    Returns complex spectrum (B,Lf) torch.cfloat
-    """
-    real, imag = signal_2ch[:,0], signal_2ch[:,1]
-    z = torch.complex(real, imag)
-    Z = torch.fft.rfft(z, dim=-1, norm='ortho')
-    return Z
-
-# ...existing code...
 def _complex_fft(signal_2ch: torch.Tensor):
+    """Full complex FFT of a two-channel (real, imag) signal.
+    signal_2ch: (B,2,L) float32
+    returns: (B,L) complex spectrum (torch.cfloat)
     """
-    signal_2ch: (B,2,L) real & imag channels
-    returns complex full-spectrum (B,L)
-    """
-    real = signal_2ch[:,0]
-    imag = signal_2ch[:,1]
+    real, imag = signal_2ch[:, 0], signal_2ch[:, 1]
     z = torch.complex(real, imag)
     return torch.fft.fft(z, dim=-1, norm='ortho')
 
-# replace old _complex_rfft calls inside combined_loss:
-# Zp = _complex_rfft(pred)
-# Zt = _complex_rfft(target)
-# with:
-Zp = _complex_fft(pred)
-Zt = _complex_fft(target)
-# ...existing code...
+
+def _rfft_mag(signal_2ch: torch.Tensor, eps: float = 1e-6, half: bool = True):
+    """Magnitude spectrum from complex input without using rfft on complex.
+    We compute complex FFT, then optionally take half-spectrum magnitude.
+    """
+    real, imag = signal_2ch[:, 0], signal_2ch[:, 1]
+    z = torch.complex(real, imag)
+    Z = torch.fft.fft(z, dim=-1, norm='ortho')
+    mag = torch.abs(Z)
+    if half:
+        L = z.shape[-1]
+        mag = mag[..., : (L // 2) + 1]
+    return torch.clamp(mag, min=eps)
+
+
 
 def combined_loss(pred: torch.Tensor,
                   target: torch.Tensor,
-                  dt: float = None,
-                  x_ref: torch.Tensor = None,
+                  dt: Optional[float] = None,
+                  x_ref: Optional[torch.Tensor] = None,
                   freq_weight: float = 0.6,
                   time_weight: float = 0.4,
                   l1_weight: float = 0.0,
                   tv_weight: float = 0.0,
-                  self_denoise_consistency: float = 0.05):
+                  self_denoise_consistency: float = 0.05,
+                  eps: float = 1e-6) -> torch.Tensor:
     """
+    Stable hybrid loss combining time-domain MSE and rFFT magnitude MSE.
     pred/target: (B,2,L)
-    dt: dwell time (optional, for potential future phys terms)
+    dt: dwell time (optional, reserved)
     x_ref: original noisy input (optional, encourages minimal distortion)
+    Returns finite scalar tensor; non-finite intermediates are clamped.
     """
     # Time-domain MSE
     td_mse = F.mse_loss(pred, target)
 
-    # Frequency-domain MSE (magnitude)
-    Zp = _complex_rfft(pred)
-    Zt = _complex_rfft(target)
-    mag_p = torch.abs(Zp)
-    mag_t = torch.abs(Zt)
+    # Frequency-domain magnitude loss (half-spectrum)
+    mag_p = _rfft_mag(pred, eps=eps)
+    mag_t = _rfft_mag(target, eps=eps)
     fd_mse = F.mse_loss(mag_p, mag_t)
 
-    # Optional amplitude-weighted emphasis on strong lines
-    # (stabilize by adding small floor)
-    weight = (mag_t + 1e-6) / (mag_t.mean(dim=-1, keepdim=True) + 1e-6)
+    # Amplitude-weighted emphasis on strong spectral bins
+    denom = torch.clamp(mag_t.mean(dim=-1, keepdim=True), min=eps)
+    weight = mag_t / denom
     fd_weighted = torch.mean(((mag_p - mag_t) ** 2) * weight)
-
     freq_term = 0.5 * (fd_mse + fd_weighted)
 
     # L1 sparsity on residual (pred - target)
-    l1_term = torch.mean(torch.abs(pred - target)) if l1_weight > 0 else 0.0
+    l1_term = torch.mean(torch.abs(pred - target)) if l1_weight > 0 else torch.zeros((), device=pred.device)
 
     # Simple total variation (smoothness) along time
-    if tv_weight > 0:
-        tv = torch.mean(torch.abs(pred[:,:,1:] - pred[:,:,:-1]))
-    else:
-        tv = 0.0
+    tv = torch.mean(torch.abs(pred[:, :, 1:] - pred[:, :, :-1])) if tv_weight > 0 else torch.zeros((), device=pred.device)
 
     # Consistency: keep close to input if self-denoising (avoid hallucination)
-    if x_ref is not None and self_denoise_consistency > 0:
-        cons = F.mse_loss(pred, x_ref)
-    else:
-        cons = 0.0
+    cons = F.mse_loss(pred, x_ref) if (x_ref is not None and self_denoise_consistency > 0) else torch.zeros((), device=pred.device)
 
     total = (freq_weight * freq_term +
              time_weight * td_mse +
@@ -286,5 +292,26 @@ def combined_loss(pred: torch.Tensor,
              tv_weight * tv +
              self_denoise_consistency * cons)
 
+    if not torch.isfinite(total):
+        # Avoid propagating NaNs/Infs
+        return torch.zeros((), device=pred.device, dtype=pred.dtype)
     return total
+
+
+# ----- Utility: check and reinitialize model if non-finite -----
+def _has_non_finite_params(model: nn.Module) -> bool:
+    for _, p in model.named_parameters():
+        if p is not None and not torch.isfinite(p).all():
+            return True
+    return False
+
+
+def _reinit_model_(model: nn.Module) -> None:
+    """In-place Kaiming initialization of Conv1d/Linear layers."""
+    for m in model.modules():
+        if isinstance(m, (nn.Conv1d, nn.Linear)):
+            if m.weight is not None:
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+            if getattr(m, 'bias', None) is not None and m.bias is not None:
+                nn.init.zeros_(m.bias)
 # ...existing code...
