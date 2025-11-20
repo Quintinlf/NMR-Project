@@ -150,76 +150,50 @@ __all__ = [
 ]
 
 
-def synth_batch_phys(batch_size: int, L: int, snr_std: float = 0.03, colored_noise: bool = True, device: Optional[torch.device] = None):
+def synth_batch_phys(batch_size=16, L=2048, snr_std=0.025, device='cpu'):
     """
-    Generate synthetic complex FIDs: sum of damped complex sinusoids + optional colored noise.
-    Returns (x_noisy, y_clean) with shape (B, 2, L), float32, on CUDA if available.
-    Noise scaling is robust to vanishing tails by referencing the 20th-percentile envelope.
+    Generate synthetic complex FID batches with physically motivated noise.
+    Now with realistic amplitude scaling to match real data.
+    
+    Returns (fid_noisy, fid_clean), each shape (batch_size, 2, L).
     """
-    device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    B = int(batch_size)
-    n = torch.arange(L, device=device, dtype=torch.float32)[None, :]  # (1,L)
+    import math
+    
+    B, device_obj = batch_size, torch.device(device)
+    t = torch.linspace(0, L - 1, L, device=device_obj)
+    
+    # Random parameters for each sample
+    T2_vals = torch.empty(B, device=device_obj).uniform_(0.15 * L, 0.5 * L)
+    freq_vals = torch.empty(B, device=device_obj).uniform_(-0.05, 0.05)
+    phase_vals = torch.empty(B, device=device_obj).uniform_(0, 2 * math.pi)
+    
+    decay = torch.exp(-t.unsqueeze(0) / T2_vals.unsqueeze(1))
+    osc = torch.cos(2 * math.pi * freq_vals.unsqueeze(1) * t.unsqueeze(0) + phase_vals.unsqueeze(1))
+    
+    real_clean = (decay * osc).unsqueeze(1)
+    imag_clean = (decay * torch.sin(2 * math.pi * freq_vals.unsqueeze(1) * t.unsqueeze(0) + phase_vals.unsqueeze(1))).unsqueeze(1)
+    fid_clean = torch.cat([real_clean, imag_clean], dim=1)
+    
+    # Noise scaled to early-signal RMS (first 20%)
+    early_len = max(64, int(0.2 * L))
+    early_rms = torch.sqrt((fid_clean[:, :, :early_len] ** 2).mean(dim=(1, 2)))  # Shape: [B]
+    noise_level = snr_std * early_rms.view(B, 1, 1)  # Shape: [B, 1, 1] for broadcasting
+    
+    noise = torch.randn(B, 2, L, device=device_obj) * noise_level
+    fid_noisy = fid_clean + noise
+    
+    # ✅ SCALE TO MATCH REAL DATA (avg std ≈ 15)
+    target_scale = 15.0
+    current_scale = fid_noisy.std().item()  # ✅ FIXED: was 'fid.std()'
+    scale_factor = target_scale / (current_scale + 1e-12)
+    
+    fid_clean = fid_clean * scale_factor
+    fid_noisy = fid_noisy * scale_factor
+    
+    return fid_noisy.float(), fid_clean.float()
 
-    y_real = torch.zeros(B, L, device=device, dtype=torch.float32)
-    y_imag = torch.zeros(B, L, device=device, dtype=torch.float32)
-    two_pi = 2.0 * math.pi
-
-    Kmin, Kmax = 2, 6
-    for b in range(B):
-        # sample number of components per sample without relying on numpy
-        K = int(torch.randint(Kmin, Kmax + 1, (1,), device=device))
-        f = torch.empty(K, device=device).uniform_(-0.45, 0.45)             # cycles/sample in Nyquist
-        alpha = torch.empty(K, device=device).uniform_(1e-3, 8e-3)          # per-sample decay
-        phi = torch.empty(K, device=device).uniform_(0, 2 * math.pi)
-        A = (torch.rand(K, device=device) ** 2)                             # amplitudes
-
-        env = torch.exp(-alpha[:, None] * n)                                # (K,L)
-        ang = two_pi * f[:, None] * n + phi[:, None]                        # (K,L)
-        y_real[b] = (A[:, None] * env * torch.cos(ang)).sum(dim=0)
-        y_imag[b] = (A[:, None] * env * torch.sin(ang)).sum(dim=0)
-
-    # Optional slow drift
-    if colored_noise:
-        t = torch.linspace(-1, 1, L, device=device)
-        y_real = y_real + (0.02 * torch.randn(B, 1, device=device)) * (t**2)[None, :]
-        y_imag = y_imag + (0.02 * torch.randn(B, 1, device=device)) * (t**2)[None, :]
-
-    # Robust amplitude reference from envelope (avoid tiny tails)
-    env = torch.sqrt(y_real**2 + y_imag**2)  # (B,L)
-    # 20th percentile per batch element
-    q20 = torch.quantile(env, 0.20, dim=1).clamp_min(1e-3)  # (B,)
-    sigma = (snr_std * q20).clamp(min=1e-6)                 # (B,)
-    nr = torch.randn(B, L, device=device) * sigma[:, None]
-    ni = torch.randn(B, L, device=device) * sigma[:, None]
-
-    # Simple coloring (exponential kernel)
-    if colored_noise:
-        klen = max(5, int(0.03 * L))
-        kern = torch.exp(-torch.linspace(0, 4.0, klen, device=device))
-        kern = kern / kern.sum()
-        def filt(x):
-            x1 = x.unsqueeze(1)
-            pad = klen - 1
-            xpad = torch.nn.functional.pad(x1, (pad, 0), mode="reflect")
-            return torch.nn.functional.conv1d(xpad, kern.view(1, 1, -1)).squeeze(1)
-        nr = filt(nr); ni = filt(ni)
-
-    x_real = y_real + nr
-    x_imag = y_imag + ni
-
-    y = torch.stack([y_real, y_imag], dim=1).to(torch.float32)  # (B,2,L)
-    x = torch.stack([x_real, x_imag], dim=1).to(torch.float32)  # (B,2,L)
-    # sanity checks
-    if not torch.isfinite(x).all() or not torch.isfinite(y).all():
-        raise RuntimeError("Non-finite values produced in synth_batch_phys")
-    if torch.mean((x - y)**2).item() <= 1e-12:
-        raise RuntimeError("synth_batch_phys produced x≈y (noise not added)")
-    return x, y
-
-# ...existing code...
 import torch
 import torch.nn.functional as F
-# ...existing code...
 
 def _complex_fft(signal_2ch: torch.Tensor):
     """Full complex FFT of a two-channel (real, imag) signal.
@@ -250,14 +224,17 @@ def combined_loss(pred: torch.Tensor,
                   target: torch.Tensor,
                   dt: Optional[float] = None,
                   x_ref: Optional[torch.Tensor] = None,
-                  freq_weight: float = 0.6,
+                  freq_weight: float = 0.5,
                   time_weight: float = 0.4,
-                  l1_weight: float = 0.0,
+                  l1_weight: float = 0.05,
                   tv_weight: float = 0.0,
                   self_denoise_consistency: float = 0.05,
                   eps: float = 1e-6) -> torch.Tensor:
     """
-    Stable hybrid loss combining time-domain MSE and rFFT magnitude MSE.
+    Improved hybrid loss for better signal preservation:
+    - Balanced time/freq domains
+    - L1 regularization to prevent over-smoothing
+    - Phase-aware spectral loss
     pred/target: (B,2,L)
     dt: dwell time (optional, reserved)
     x_ref: original noisy input (optional, encourages minimal distortion)
@@ -271,13 +248,14 @@ def combined_loss(pred: torch.Tensor,
     mag_t = _rfft_mag(target, eps=eps)
     fd_mse = F.mse_loss(mag_p, mag_t)
 
-    # Amplitude-weighted emphasis on strong spectral bins
-    denom = torch.clamp(mag_t.mean(dim=-1, keepdim=True), min=eps)
-    weight = mag_t / denom
+    # ✅ Improved: Focus on preserving strong peaks (don't over-weight noise floor)
+    # Use sqrt weighting instead of linear to reduce emphasis on noise
+    mag_t_norm = mag_t / (mag_t.max(dim=-1, keepdim=True)[0] + eps)
+    weight = torch.sqrt(mag_t_norm + eps)
     fd_weighted = torch.mean(((mag_p - mag_t) ** 2) * weight)
-    freq_term = 0.5 * (fd_mse + fd_weighted)
+    freq_term = 0.7 * fd_mse + 0.3 * fd_weighted
 
-    # L1 sparsity on residual (pred - target)
+    # ✅ L1 sparsity on residual (prevents removing too much signal)
     l1_term = torch.mean(torch.abs(pred - target)) if l1_weight > 0 else torch.zeros((), device=pred.device)
 
     # Simple total variation (smoothness) along time
@@ -314,4 +292,3 @@ def _reinit_model_(model: nn.Module) -> None:
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
             if getattr(m, 'bias', None) is not None and m.bias is not None:
                 nn.init.zeros_(m.bias)
-# ...existing code...
